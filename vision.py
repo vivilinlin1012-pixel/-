@@ -10,20 +10,34 @@ from PIL import Image
 def unpack(content):
     if isinstance(content,list):
         content="".join(x.get("text","") for x in content if isinstance(x,dict))
-    m=re.search(r"\{.*\}",content,re.S)
-    if not m:raise ValueError("模型未返回 JSON 对象")
-    return json.loads(m.group())
+    if not isinstance(content,str):
+        raise ValueError("模型返回空内容或非文本")
+    decoder=json.JSONDecoder()
+    for m in re.finditer(r"\{",content):
+        try:
+            obj,_=decoder.raw_decode(content[m.start():])
+            if isinstance(obj,dict):return obj
+        except ValueError:continue
+    raise ValueError("模型未返回完整JSON对象")
 
 async def call(url,key,model,messages):
-    async with httpx.AsyncClient(timeout=90) as client:
-        resp=await client.post(url,headers={"Authorization":"Bearer "+key},json={"model":model,"temperature":0.1,"messages":messages})
-    resp.raise_for_status()
-    return unpack(resp.json()["choices"][0]["message"]["content"])
+    local=url.startswith(("http://127.0.0.1:","http://localhost:"))
+    payload={"model":model,"temperature":0.1,"messages":messages,"response_format":{"type":"json_object"},"max_tokens":2048}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(600,connect=15),trust_env=not local) as client:
+        for attempt in range(2):
+            resp=await client.post(url,headers={"Authorization":"Bearer "+key},json=payload)
+            resp.raise_for_status()
+            choice=resp.json()["choices"][0]
+            try:return unpack(choice["message"].get("content"))
+            except ValueError:
+                if attempt:raise ValueError("模型连续两次未返回完整JSON；结束原因："+str(choice.get("finish_reason")))
+                payload["temperature"]=0
+                payload["max_tokens"]=4096
 
 async def describe(url,key,model,path):
     with Image.open(path) as image:
         image=image.convert("RGB")
-        image.thumbnail((1200,1200))
+        image.thumbnail((768,768))
         out=io.BytesIO()
         image.save(out,format="JPEG",quality=75)
     b64=base64.b64encode(out.getvalue()).decode("ascii")
@@ -54,8 +68,8 @@ async def match(pid,store,shots,assets,base,key,model):
         if m.get("shot_id") not in valid_shots:continue
         k=m.get("keyframe") or ""
         if ids.get(k)!="keyframe":k=""
-        cs=[x for x in m.get("characters",[]) if ids.get(x)=="character"]
-        es=[x for x in m.get("environments",[]) if ids.get(x)=="environment"]
+        cs=[x for x in (m.get("characters") or []) if isinstance(x,str) and ids.get(x)=="character"]
+        es=[x for x in (m.get("environments") or []) if isinstance(x,str) and ids.get(x)=="environment"]
         try:score=max(0.,min(1.,float(m.get("confidence",0))))
         except (ValueError,TypeError):score=0.
         out.append({"id":m["shot_id"],"keyframe":k,"characters":cs,"environments":es,"confidence":score})

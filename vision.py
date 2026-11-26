@@ -79,72 +79,61 @@ async def match(pid,store,shots,assets,base,key,model):
         out.append({"id":m["shot_id"],"keyframe":k,"characters":cs,"environments":es,"confidence":score})
     return out
 
+def indices(value,size):
+    if not isinstance(value,list):value=[value]
+    out=[]
+    for n in value:
+        if isinstance(n,str) and n.strip().isdigit():n=int(n.strip())
+        if type(n)==int and 1<=n<=size and n not in out:out.append(n)
+    return out
+
 async def match_keyframes(pid,store,script,assets,base,key,model,target=None,progress=lambda x:None):
     endpoint=base.rstrip("/")+"/chat/completions"
-    async def cached(a):
+    cache=Path(store)/pid/"vision-cache"
+    cache.mkdir(exist_ok=True)
+    async def indexed(a):
         path=Path(store)/pid/"assets"/a["path"]
-        cache=Path(store)/pid/"vision-cache"
-        cache.mkdir(exist_ok=True)
-        name=hashlib.sha256((base+model+a["id"]+"v5").encode()).hexdigest()
-        p=cache/(name+".json")
+        p=cache/(hashlib.sha256((base+model+a["id"]+"v5").encode()).hexdigest()+".json")
         if p.exists():return json.loads(p.read_text())
-        progress("识别素材："+a["label"])
-        value=await describe(endpoint,key,model,path)
-        p.write_text(json.dumps(value,ensure_ascii=False))
-        return value
-    refs=[x for x in assets if x["kind"] in ("character","environment")]
+        progress("建立素材索引："+a["label"])
+        v=await describe(endpoint,key,model,path)
+        p.write_text(json.dumps(v,ensure_ascii=False))
+        return v
+    pools={"character":[],"environment":[]}
+    for a in assets:
+        if a["kind"] in pools:
+            try:v=await indexed(a)
+            except Exception:continue
+            pools[a["kind"]].append({"id":a["id"],"name":a["label"],"visual":v})
+    # Preserve original lines; never invent dialogue or split by arbitrary line counts.
+    lines=[x.strip() for x in script.splitlines() if x.strip()]
+    def grams(x):
+        x=re.sub(r"[^\w\u4e00-\u9fff]","",x.lower())
+        return set(x[i:i+2] for i in range(len(x)-1))
+    def shortlist(visual):
+        q=grams(json.dumps(visual,ensure_ascii=False))
+        scores=[len(q & grams(line)) for line in lines]
+        if len(lines)<=80:return list(range(len(lines)))
+        best=sorted(range(len(lines)),key=lambda i:scores[i],reverse=True)[:24]
+        return sorted({j for i in best for j in range(max(0,i-1),min(len(lines),i+2))})
     out=[]
-    lines=[line for line in script.splitlines() if line.strip()]
     for a in assets:
         if a["kind"]!="keyframe" or (target and a["id"]!=target):continue
-        progress("识别当前关键图："+a["label"])
-        visual=await cached(a)
-        progress("匹配剧本原文："+a["label"])
-        blocks=[]
-        for line in lines:
-            if not blocks or re.match(r"^\s*(第[一二三四五六七八九十百\d]+[场幕]|场景\s*\d+)",line):
-                blocks.append([])
-            blocks[-1].append(line)
-        passages=[]
-        for block in blocks:
-            for i in range(0,len(block),8):
-                passages.append({"n":len(passages)+1,"scene":block[0],"text":"\n".join(block[i:i+8])})
-        m={};plot="";dialogue="";errors=[]
-        try:
-            m=await call(endpoint,key,model,[{"role":"user","content":"根据关键图视觉描述选择唯一最符合的剧本段落编号。只返回JSON：{\"passage\":1,\"plot\":\"该镜头剧情摘要\",\"dialogue\":\"该镜头原文对白，无则空\",\"emotion\":\"人物情绪\"}。不要跨场次。"+json.dumps({"visual":visual,"passages":passages},ensure_ascii=False)}])
-            n=int(m.get("passage",0))
-            if not 1<=n<=len(passages):raise ValueError("段落编号无效")
-            passage=passages[n-1]
-            m["scene"]=passage["scene"]
-            plot=str(m.get("plot") or passage["text"])
-            dialogue=str(m.get("dialogue") or "")
-            if dialogue and dialogue not in passage["text"]:dialogue=""
-        except Exception as exc:
-            errors.append("剧情："+str(exc))
-            m={}
-        progress("匹配人物与环境："+a["label"])
-        candidates=[]
-        for i,x in enumerate(refs):
-            try:
-                description=await cached(x)
-            except (ValueError,httpx.HTTPError,OSError) as exc:
-                description={"analysis_error":str(exc)}
-            candidates.append({"n":i+1,"kind":x["kind"],"label":x["label"],"visual":description})
-        try:
-            matchrefs=await call(endpoint,key,model,[{"role":"user","content":'优先比较关键图与参考素材的视觉描述：人物年龄、发型、服装、建筑、陈设、光线。素材名称仅辅助判断，剧情冲突时以可见画面为准。仅返回JSON：{"characters":[1],"environments":[2]}。编号必须来自候选列表且类别一致；不确定返回空数组。'+json.dumps({"visual":visual,"plot":plot,"scene":m.get("scene",""),"refs":candidates},ensure_ascii=False)}]) if refs else {}
-        except Exception as exc:
-            matchrefs={}
-            errors.append("素材："+str(exc))
-        def pick(k,kind):
-            v=matchrefs.get(k,[])
-            if not isinstance(v,list):return []
-            selected=[]
-            for n in v:
-                if isinstance(n,str) and n.strip().isdigit():n=int(n.strip())
-                if type(n)==int and 1<=n<=len(refs) and refs[n-1]["kind"]==kind:
-                    selected.append(refs[n-1]["id"])
-            return list(dict.fromkeys(selected))
-        try:score=max(0,min(1,float(m.get("confidence",0))))
-        except (ValueError,TypeError):score=0
-        out.append(dict(keyframe=a["id"],scene=str(m.get("scene","剧情待核对")),plot=plot,dialogue=dialogue,emotion=str(m.get("emotion") or visual.get("mood") or ""),errors=errors,prompt="",characters=pick("characters","character"),environments=pick("environments","environment"),confidence=score,order=assets.index(a)))
+        visual=await indexed(a)
+        progress("连接三个素材池："+a["label"])
+        chosen=shortlist(visual)
+        task={"keyframe":visual,"script":[{"n":i+1,"text":lines[i]} for i in chosen]}
+        for kind,pool in pools.items():
+            task[kind]=[{"n":i+1,"name":x["name"],"visual":x["visual"]} for i,x in enumerate(pool)]
+        m=await call(endpoint,key,model,[{"role":"user","content":"你只负责匹配三个独立素材池。根据关键图选择真实对应的剧情原文编号、对白编号、人物定妆照编号、环境编号。各池编号独立，不确定返回空数组。不要生成视频指令。返回JSON：{\"scene\":\"场次\",\"plot\":[1],\"dialogue\":[],\"character\":[1],\"environment\":[1],\"emotion\":\"可见人物情绪\"}。"+json.dumps(task,ensure_ascii=False)}])
+        def original(k):
+            return "\n".join(lines[n-1] for n in indices(m.get(k,[]),len(lines)) if n-1 in chosen)
+        def refs(k):
+            return [pools[k][n-1]["id"] for n in indices(m.get(k,[]),len(pools[k]))]
+        plot=original("plot"); cs=refs("character"); es=refs("environment")
+        errors=[]
+        if not plot:errors.append("剧情未确认")
+        if pools["character"] and not cs:errors.append("人物未确认")
+        if pools["environment"] and not es:errors.append("环境未确认")
+        out.append(dict(keyframe=a["id"],scene=str(m.get("scene") or "待核对"),plot=plot,dialogue=original("dialogue"),emotion=str(m.get("emotion") or visual.get("mood") or ""),prompt="",characters=cs,environments=es,confidence=0,errors=errors,order=assets.index(a)))
     return out

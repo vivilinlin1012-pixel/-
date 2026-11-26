@@ -1,4 +1,6 @@
 import io,os,re,json,uuid,sqlite3,zipfile
+import httpx
+from vision import match as vision_match
 from pathlib import Path
 from contextlib import contextmanager
 from fastapi import FastAPI,File,Form,UploadFile,HTTPException
@@ -42,7 +44,7 @@ class Shot(BaseModel):
 @app.get("/")
 def index():return FileResponse(ROOT/"web/index.html")
 @app.get("/api/health")
-def health():return {"ok":True,"ai_configured":False}
+def health():return {"ok":True,"ai_configured":bool(os.getenv("CINEFLOW_AI_BASE_URL") and os.getenv("CINEFLOW_AI_API_KEY") and os.getenv("CINEFLOW_AI_MODEL"))}
 @app.get("/api/projects")
 def projects():
  with db() as c:return [dict(x) for x in c.execute("SELECT id,title FROM projects")]
@@ -114,12 +116,21 @@ def parse(pid:str):
  with db() as c:c.executemany("INSERT INTO shots(id,pid,ord,scene,plot,dialogue) VALUES (?,?,?,?,?,?)",rows)
  return {"shots_created":len(rows)}
 @app.post("/api/projects/{pid}/match")
-def match(pid:str):
+async def match(pid:str):
  d=data(pid);shots=d["shots"];assets=d["assets"]
  if not shots:raise HTTPException(400,"请先解析剧本")
  keys=[a for a in assets if a["kind"]=="keyframe"]
  chars=[a for a in assets if a["kind"]=="character"]
  envs=[a for a in assets if a["kind"]=="environment"]
+ base=os.getenv("CINEFLOW_AI_BASE_URL","")
+ token=os.getenv("CINEFLOW_AI_API_KEY","")
+ model=os.getenv("CINEFLOW_AI_MODEL","")
+ proposed=None
+ if base and token and model and assets:
+  try:proposed=await vision_match(pid,STORE,shots,assets,base,token,model)
+  except (httpx.HTTPError,ValueError,KeyError,TypeError) as exc:
+   raise HTTPException(502,"AI模型调用或解析失败；未修改镜头匹配结果："+type(exc).__name__) from exc
+ options={m["id"]:m for m in proposed} if proposed is not None else {}
  count=0
  with db() as c:
   for i,s in enumerate(shots):
@@ -128,8 +139,12 @@ def match(pid:str):
    cs=[a["id"] for a in chars if len(a["label"])>=2 and a["label"].lower() in words]
    es=[a["id"] for a in envs if len(a["label"])>=2 and a["label"].lower() in words]
    key=keys[i]["id"] if i<len(keys) else ""
-   c.execute("UPDATE shots SET keyframe=?,characters=?,environments=?,confidence=?,status='review' WHERE id=?",(key,json.dumps(cs),json.dumps(es),.2 if key else 0,s["id"]));count+=1
- return {"matched":count,"mode":"heuristic","message":"按上传顺序与文字标签生成低置信度候选，尚未进行视觉AI识别"}
+   score=.2 if key else 0
+   if proposed is not None:
+    m=options.get(s["id"],{})
+    key=m.get("keyframe","");cs=m.get("characters",[]);es=m.get("environments",[]);score=m.get("confidence",0)
+   c.execute("UPDATE shots SET keyframe=?,characters=?,environments=?,confidence=?,status='review' WHERE id=?",(key,json.dumps(cs),json.dumps(es),score,s["id"]));count+=1
+ return {"matched":count,"mode":"ai" if proposed is not None else "heuristic","message":"AI视觉识别完成：请审核所有候选" if proposed is not None else "按上传顺序与文字标签生成低置信度候选，尚未进行视觉AI识别"}
 @app.patch("/api/projects/{pid}/shots/{sid}")
 def edit(pid:str,sid:str,body:Shot):
  d=data(pid);fields=body.model_dump(exclude_unset=True)

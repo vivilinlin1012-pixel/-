@@ -2,7 +2,7 @@
 
 Send only to the provider configured by the user. No credentials in source.
 """
-import base64,io,json,re
+import base64,io,json,re,hashlib
 from pathlib import Path
 import httpx
 from PIL import Image
@@ -79,15 +79,27 @@ async def match(pid,store,shots,assets,base,key,model):
         out.append({"id":m["shot_id"],"keyframe":k,"characters":cs,"environments":es,"confidence":score})
     return out
 
-async def match_keyframes(pid,store,script,assets,base,key,model):
+async def match_keyframes(pid,store,script,assets,base,key,model,target=None,progress=lambda x:None):
     endpoint=base.rstrip("/")+"/chat/completions"
+    async def cached(a):
+        path=Path(store)/pid/"assets"/a["path"]
+        cache=Path(store)/pid/"vision-cache"
+        cache.mkdir(exist_ok=True)
+        name=hashlib.sha256((base+model+a["id"]+"v3").encode()).hexdigest()
+        p=cache/(name+".json")
+        if p.exists():return json.loads(p.read_text())
+        progress("识别素材："+a["label"])
+        value=await describe(endpoint,key,model,path)
+        p.write_text(json.dumps(value,ensure_ascii=False))
+        return value
     refs=[]
     for a in assets:
         if a["kind"]!="keyframe":
-            refs.append({"id":a["id"],"kind":a["kind"],"label":a["label"],"visual":await describe(endpoint,key,model,Path(store)/pid/"assets"/a["path"])})
+            refs.append({"id":a["id"],"kind":a["kind"],"label":a["label"],"visual":await cached(a)})
     out=[]
     for a in assets:
-        if a["kind"]!="keyframe":continue
+        if a["kind"]!="keyframe" or (target and a["id"]!=target):continue
+        progress("匹配剧情："+a["label"])
         visual=await describe(endpoint,key,model,Path(store)/pid/"assets"/a["path"])
         # Use short stable reference identifiers and numbered source lines.
         lines=[line for line in script.splitlines() if line.strip()]

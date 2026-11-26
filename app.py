@@ -1,6 +1,6 @@
 import io,os,re,json,uuid,sqlite3,zipfile
 import httpx
-from vision import match as vision_match
+from vision import match_keyframes
 from pathlib import Path
 from contextlib import contextmanager
 from fastapi import FastAPI,File,Form,UploadFile,HTTPException
@@ -97,54 +97,39 @@ def image(pid:str,aid:str):
  with db() as c:a=c.execute("SELECT path FROM assets WHERE id=? AND pid=?",(aid,pid)).fetchone()
  if not a:raise HTTPException(404,"图片不存在")
  return FileResponse(STORE/pid/"assets"/a["path"])
+class AIConfig(BaseModel):
+ base:str;key:str;model:str
+@app.post("/api/ai-config")
+def configure(c:AIConfig):
+ if not c.base.startswith(("https://","http://127.0.0.1:","http://localhost:")) or not c.model.strip():raise HTTPException(400,"请输入有效模型地址和名称")
+ os.environ["CINEFLOW_AI_BASE_URL"]=c.base.strip()
+ os.environ["CINEFLOW_AI_API_KEY"]=c.key.strip() or "local"
+ os.environ["CINEFLOW_AI_MODEL"]=c.model.strip()
+ return {"ok":True}
 @app.post("/api/projects/{pid}/parse")
 def parse(pid:str):
- d=data(pid)
+ d=data(pid);keys=[a for a in d["assets"] if a["kind"]=="keyframe"]
+ if not keys:raise HTTPException(400,"请先导入关键图")
  with db() as c:
-  if c.execute("SELECT COUNT(*) FROM shots WHERE pid=?",(pid,)).fetchone()[0]:raise HTTPException(409,"已有镜头，为防止覆盖人工修改，不重复解析")
- text=d["project"]["script"];blocks=[b.strip() for b in re.split(r"\n\s*\n",text) if b.strip()]
- if not blocks:raise HTTPException(400,"请先导入剧本")
- scene="场景1";rows=[]
- for b in blocks[:300]:
-  lines=b.splitlines()
-  if re.match(r"^(第.{1,8}[场幕镜]|场景|镜头|SCENE|SHOT)",lines[0],re.I):
-   scene=lines.pop(0)
-  if not lines:continue
-  dialog=[x for x in lines if re.match(r"^[\u4e00-\u9fff\w·]{1,12}[：:].+",x)]
-  plot=[x for x in lines if x not in dialog]
-  rows.append((uid(),pid,len(rows),scene,"\n".join(plot) or b,"\n".join(dialog)))
- with db() as c:c.executemany("INSERT INTO shots(id,pid,ord,scene,plot,dialogue) VALUES (?,?,?,?,?,?)",rows)
- return {"shots_created":len(rows)}
+  for i,a in enumerate(keys):
+   if not c.execute("SELECT id FROM shots WHERE pid=? AND keyframe=?",(pid,a["id"])).fetchone():
+    c.execute("INSERT INTO shots(id,pid,ord,scene,plot,dialogue,keyframe) VALUES (?,?,?,?,?,?,?)",(uid(),pid,i,"待分析","","",a["id"]))
+ return {"shots_created":len(keys)}
 @app.post("/api/projects/{pid}/match")
 async def match(pid:str):
- d=data(pid);shots=d["shots"];assets=d["assets"]
- if not shots:raise HTTPException(400,"请先解析剧本")
- keys=[a for a in assets if a["kind"]=="keyframe"]
- chars=[a for a in assets if a["kind"]=="character"]
- envs=[a for a in assets if a["kind"]=="environment"]
- base=os.getenv("CINEFLOW_AI_BASE_URL","")
- token=os.getenv("CINEFLOW_AI_API_KEY","")
- model=os.getenv("CINEFLOW_AI_MODEL","")
- proposed=None
- if base and token and model and assets:
-  try:proposed=await vision_match(pid,STORE,shots,assets,base,token,model)
-  except (httpx.HTTPError,ValueError,KeyError,TypeError) as exc:
-   raise HTTPException(502,"AI模型调用或解析失败；未修改镜头匹配结果："+type(exc).__name__) from exc
- options={m["id"]:m for m in proposed} if proposed is not None else {}
- count=0
+ d=data(pid)
+ if not d["project"]["script"].strip():raise HTTPException(400,"请先导入剧本")
+ if not any(a["kind"]=="keyframe" for a in d["assets"]):raise HTTPException(400,"请先导入关键图")
+ base=os.getenv("CINEFLOW_AI_BASE_URL","");token=os.getenv("CINEFLOW_AI_API_KEY","");model=os.getenv("CINEFLOW_AI_MODEL","")
+ if not all((base,token,model)):raise HTTPException(400,"请先配置视觉AI模型；不会用上传顺序冒充智能匹配")
+ try:results=await match_keyframes(pid,STORE,d["project"]["script"],d["assets"],base,token,model)
+ except Exception as exc:raise HTTPException(502,"AI分析失败，原有结果未修改："+type(exc).__name__) from exc
  with db() as c:
-  for i,s in enumerate(shots):
-   if s["status"]=="approved":continue
-   words=(s["scene"]+s["plot"]+s["dialogue"]).lower()
-   cs=[a["id"] for a in chars if len(a["label"])>=2 and a["label"].lower() in words]
-   es=[a["id"] for a in envs if len(a["label"])>=2 and a["label"].lower() in words]
-   key=keys[i]["id"] if i<len(keys) else ""
-   score=.2 if key else 0
-   if proposed is not None:
-    m=options.get(s["id"],{})
-    key=m.get("keyframe","");cs=m.get("characters",[]);es=m.get("environments",[]);score=m.get("confidence",0)
-   c.execute("UPDATE shots SET keyframe=?,characters=?,environments=?,confidence=?,status='review' WHERE id=?",(key,json.dumps(cs),json.dumps(es),score,s["id"]));count+=1
- return {"matched":count,"mode":"ai" if proposed is not None else "heuristic","message":"AI视觉识别完成：请审核所有候选" if proposed is not None else "按上传顺序与文字标签生成低置信度候选，尚未进行视觉AI识别"}
+  c.execute("DELETE FROM shots WHERE pid=? AND status!='approved'",(pid,))
+  for i,m in enumerate(results):
+   if c.execute("SELECT id FROM shots WHERE pid=? AND keyframe=? AND status='approved'",(pid,m["keyframe"])).fetchone():continue
+   c.execute("INSERT INTO shots(id,pid,ord,scene,plot,dialogue,emotion,prompt,keyframe,characters,environments,confidence,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",(uid(),pid,i,m["scene"],m["plot"],m["dialogue"],m["emotion"],m["prompt"],m["keyframe"],json.dumps(m["characters"]),json.dumps(m["environments"]),m["confidence"],"review"))
+ return {"matched":len(results),"mode":"ai","message":"关键图智能分析完成，请检查结果"}
 @app.patch("/api/projects/{pid}/shots/{sid}")
 def edit(pid:str,sid:str,body:Shot):
  d=data(pid);fields=body.model_dump(exclude_unset=True)

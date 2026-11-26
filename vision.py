@@ -92,36 +92,28 @@ async def match_keyframes(pid,store,script,assets,base,key,model,target=None,pro
         value=await describe(endpoint,key,model,path)
         p.write_text(json.dumps(value,ensure_ascii=False))
         return value
-    refs=[]
-    for a in assets:
-        if a["kind"]!="keyframe":
-            refs.append({"id":a["id"],"kind":a["kind"],"label":a["label"],"visual":await cached(a)})
+    refs=[x for x in assets if x["kind"] in ("character","environment")]
     out=[]
+    lines=[line for line in script.splitlines() if line.strip()]
     for a in assets:
         if a["kind"]!="keyframe" or (target and a["id"]!=target):continue
-        progress("匹配剧情："+a["label"])
-        visual=await describe(endpoint,key,model,Path(store)/pid/"assets"/a["path"])
-        # Use short stable reference identifiers and numbered source lines.
-        lines=[line for line in script.splitlines() if line.strip()]
-        numbered=[{"n":i+1,"text":line} for i,line in enumerate(lines)]
-        shortrefs=[{"n":i+1,"kind":x["kind"],"label":x["label"],"visual":x["visual"]} for i,x in enumerate(refs)]
-        task={"script_lines":numbered,"keyframe":visual,"references":shortrefs}
-        instruction='根据关键图内容定位剧本原文行号。只返回JSON，格式示例：{"scene":"场次名称","plot_lines":[1,2],"dialogue_lines":[],"emotion":"具体表演情绪","prompt":"具体动作、运镜、光影和表演指导","characters":[1],"environments":[2],"confidence":0.8,"order":1}。行号和参考图编号必须来自输入。剧情必须选实际画面描述，台词仅选实际对白，无对白返回空数组。人物和环境编号必须对应各自类别。不得输出空对象。'
-        m=await call(endpoint,key,model,[{"role":"user","content":instruction+json.dumps(task,ensure_ascii=False)}],required=("scene","plot_lines","emotion","prompt"))
+        progress("识别当前关键图："+a["label"])
+        visual=await cached(a)
+        progress("匹配剧本原文："+a["label"])
+        task={"script_lines":[{"n":i+1,"text":line} for i,line in enumerate(lines)],"keyframe":visual}
+        m=await call(endpoint,key,model,[{"role":"user","content":'根据画面匹配剧本。只返回JSON：{"scene":"场次","plot_lines":[1],"dialogue_lines":[],"emotion":"人物情绪","confidence":0.8}。剧情行号必须来自输入，不选标题或元数据。无对白返回空数组。'+json.dumps(task,ensure_ascii=False)}],required=("scene","plot_lines","emotion"))
         def source(k):
             values=m.get(k,[])
-            if not isinstance(values,list):return ""
-            return "\n".join(lines[n-1] for n in values if type(n)==int and 1<=n<=len(lines))
-        def refs_for(k,kind):
-            values=m.get(k,[])
-            if not isinstance(values,list):return []
-            return [refs[n-1]["id"] for n in values if type(n)==int and 1<=n<=len(refs) and refs[n-1]["kind"]==kind]
-        def string(k):
-            return m[k] if isinstance(m.get(k),str) else ""
+            return "\n".join(lines[n-1] for n in values if type(n)==int and 1<=n<=len(lines)) if isinstance(values,list) else ""
         plot=source("plot_lines");dialogue=source("dialogue_lines")
-        if not plot or not string("emotion") or not string("prompt"):
-            raise ValueError("关键图 "+a["label"]+" 未返回有效剧情或表演指导")
-        try:score=max(0,min(1,float(m.get("confidence",0))));order=float(m.get("order",len(out)))
-        except (ValueError,TypeError):score=0;order=len(out)
-        out.append(dict(keyframe=a["id"],scene=string("scene"),plot=plot,dialogue=dialogue,emotion=string("emotion"),prompt=string("prompt"),characters=refs_for("characters","character"),environments=refs_for("environments","environment"),confidence=score if plot else 0,order=order))
-    return sorted(out,key=lambda x:x["order"])
+        if not plot or not isinstance(m["emotion"],str):raise ValueError("未找到有效剧情")
+        progress("匹配人物与环境："+a["label"])
+        candidates=[{"n":i+1,"kind":x["kind"],"label":x["label"]} for i,x in enumerate(refs)]
+        matchrefs=await call(endpoint,key,model,[{"role":"user","content":'根据画面描述、原文剧情及素材名称选出对应角色造型和环境。仅返回JSON：{"characters":[1],"environments":[2]}。编号必须来自候选列表且类别一致；不确定返回空数组。'+json.dumps({"visual":visual,"plot":plot,"scene":m["scene"],"refs":candidates},ensure_ascii=False)}]) if refs else {}
+        def pick(k,kind):
+            v=matchrefs.get(k,[])
+            return [refs[n-1]["id"] for n in v if type(n)==int and 1<=n<=len(refs) and refs[n-1]["kind"]==kind] if isinstance(v,list) else []
+        try:score=max(0,min(1,float(m.get("confidence",0))))
+        except (ValueError,TypeError):score=0
+        out.append(dict(keyframe=a["id"],scene=str(m["scene"]),plot=plot,dialogue=dialogue,emotion=m["emotion"],prompt="",characters=pick("characters","character"),environments=pick("environments","environment"),confidence=score,order=assets.index(a)))
+    return out

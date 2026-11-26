@@ -100,13 +100,28 @@ async def match_keyframes(pid,store,script,assets,base,key,model,target=None,pro
         progress("识别当前关键图："+a["label"])
         visual=await cached(a)
         progress("匹配剧本原文："+a["label"])
-        task={"script_lines":[{"n":i+1,"text":line} for i,line in enumerate(lines)],"keyframe":visual}
-        m=await call(endpoint,key,model,[{"role":"user","content":'根据画面匹配剧本。先排除与可见环境、人物服装、动作、昼夜明显冲突的场次。只选当前镜头直接对应的连续剧情和对白，不得把后续场次台词混入。只返回JSON：{"scene":"场次","plot_lines":[1],"dialogue_lines":[],"emotion":"人物情绪","confidence":0.8}。剧情行号必须来自输入，不选标题或元数据。无对白返回空数组。'+json.dumps(task,ensure_ascii=False)}],required=("scene","plot_lines","emotion"))
-        def source(k):
-            values=m.get(k,[])
-            return "\n".join(lines[n-1] for n in values if type(n)==int and 1<=n<=len(lines)) if isinstance(values,list) else ""
-        plot=source("plot_lines");dialogue=source("dialogue_lines")
-        if not plot or not isinstance(m["emotion"],str):raise ValueError("未找到有效剧情")
+        blocks=[]
+        for line in lines:
+            if not blocks or re.match(r"^\s*(第[一二三四五六七八九十百\d]+[场幕]|场景\s*\d+)",line):
+                blocks.append([])
+            blocks[-1].append(line)
+        passages=[]
+        for block in blocks:
+            for i in range(0,len(block),8):
+                passages.append({"n":len(passages)+1,"scene":block[0],"text":"\n".join(block[i:i+8])})
+        m={};plot="";dialogue="";errors=[]
+        try:
+            m=await call(endpoint,key,model,[{"role":"user","content":"根据关键图视觉描述选择唯一最符合的剧本段落编号。只返回JSON：{\"passage\":1,\"plot\":\"该镜头剧情摘要\",\"dialogue\":\"该镜头原文对白，无则空\",\"emotion\":\"人物情绪\"}。不要跨场次。"+json.dumps({"visual":visual,"passages":passages},ensure_ascii=False)}])
+            n=int(m.get("passage",0))
+            if not 1<=n<=len(passages):raise ValueError("段落编号无效")
+            passage=passages[n-1]
+            m["scene"]=passage["scene"]
+            plot=str(m.get("plot") or passage["text"])
+            dialogue=str(m.get("dialogue") or "")
+            if dialogue and dialogue not in passage["text"]:dialogue=""
+        except Exception as exc:
+            errors.append("剧情："+str(exc))
+            m={}
         progress("匹配人物与环境："+a["label"])
         candidates=[]
         for i,x in enumerate(refs):
@@ -115,7 +130,11 @@ async def match_keyframes(pid,store,script,assets,base,key,model,target=None,pro
             except (ValueError,httpx.HTTPError,OSError) as exc:
                 description={"analysis_error":str(exc)}
             candidates.append({"n":i+1,"kind":x["kind"],"label":x["label"],"visual":description})
-        matchrefs=await call(endpoint,key,model,[{"role":"user","content":'优先比较关键图与参考素材的视觉描述：人物年龄、发型、服装、建筑、陈设、光线。素材名称仅辅助判断，剧情冲突时以可见画面为准。仅返回JSON：{"characters":[1],"environments":[2]}。编号必须来自候选列表且类别一致；不确定返回空数组。'+json.dumps({"visual":visual,"plot":plot,"scene":m["scene"],"refs":candidates},ensure_ascii=False)}]) if refs else {}
+        try:
+            matchrefs=await call(endpoint,key,model,[{"role":"user","content":'优先比较关键图与参考素材的视觉描述：人物年龄、发型、服装、建筑、陈设、光线。素材名称仅辅助判断，剧情冲突时以可见画面为准。仅返回JSON：{"characters":[1],"environments":[2]}。编号必须来自候选列表且类别一致；不确定返回空数组。'+json.dumps({"visual":visual,"plot":plot,"scene":m.get("scene",""),"refs":candidates},ensure_ascii=False)}]) if refs else {}
+        except Exception as exc:
+            matchrefs={}
+            errors.append("素材："+str(exc))
         def pick(k,kind):
             v=matchrefs.get(k,[])
             if not isinstance(v,list):return []
@@ -127,5 +146,5 @@ async def match_keyframes(pid,store,script,assets,base,key,model,target=None,pro
             return list(dict.fromkeys(selected))
         try:score=max(0,min(1,float(m.get("confidence",0))))
         except (ValueError,TypeError):score=0
-        out.append(dict(keyframe=a["id"],scene=str(m["scene"]),plot=plot,dialogue=dialogue,emotion=m["emotion"],prompt="",characters=pick("characters","character"),environments=pick("environments","environment"),confidence=score,order=assets.index(a)))
+        out.append(dict(keyframe=a["id"],scene=str(m.get("scene","剧情待核对")),plot=plot,dialogue=dialogue,emotion=str(m.get("emotion") or visual.get("mood") or ""),errors=errors,prompt="",characters=pick("characters","character"),environments=pick("environments","environment"),confidence=score,order=assets.index(a)))
     return out

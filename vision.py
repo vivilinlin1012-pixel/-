@@ -126,6 +126,9 @@ async def match_keyframes(pid,store,script,assets,base,key,model,target=None,pro
         for kind,pool in pools.items():
             task[kind]=[{"n":i+1,"name":x["name"],"visual":x["visual"]} for i,x in enumerate(pool)]
         m=await call(endpoint,key,model,[{"role":"user","content":"你只负责匹配三个独立素材池。根据关键图选择真实对应的剧情原文编号、对白编号、人物定妆照编号、环境编号。各池编号独立，不确定返回空数组。不要生成视频指令。返回JSON：{\"scene\":\"场次\",\"plot\":[1],\"dialogue\":[],\"character\":[1],\"environment\":[1],\"emotion\":\"可见人物情绪\"}。"+json.dumps(task,ensure_ascii=False)}])
+        diagnostic=Path(store)/pid/"match-diagnostics"
+        diagnostic.mkdir(exist_ok=True)
+        (diagnostic/(a["id"]+".json")).write_text(json.dumps({"keyframe":a["label"],"input":task,"model_response":m},ensure_ascii=False,indent=2))
         def original(k):
             return "\n".join(lines[n-1] for n in indices(m.get(k,[]),len(lines)) if n-1 in chosen)
         def refs(k):

@@ -137,7 +137,7 @@ async def match(pid:str,target:str="",retry:bool=False):
  if not d["project"]["script"].strip():raise HTTPException(400,"请先导入剧本")
  existing={s["keyframe"]:s for s in d["shots"]}
  keys=[a for a in d["assets"] if a["kind"]=="keyframe" and (not target or a["id"]==target) and existing.get(a["id"],{}).get("status")!="approved"]
- if retry:keys=[a for a in keys if not existing.get(a["id"],{}).get("plot") or not existing.get(a["id"],{}).get("emotion")]
+ if retry:keys=[a for a in keys if not existing.get(a["id"],{}).get("plot") or not existing.get(a["id"],{}).get("emotion") or not existing.get(a["id"],{}).get("characters") or not existing.get(a["id"],{}).get("environments")]
  if not keys:raise HTTPException(400,"没有需要分析的关键图")
  base,token,model=settings()
  j=jobs[pid]={"state":"running","total":len(keys),"done":0,"success":0,"errors":[],"message":"准备分析"}
@@ -151,8 +151,11 @@ async def match(pid:str,target:str="",retry:bool=False):
       if not c.execute("SELECT id FROM shots WHERE pid=? AND keyframe=? AND status='approved'",(pid,a["id"])).fetchone():
        c.execute("DELETE FROM shots WHERE pid=? AND keyframe=? AND status!='approved'",(pid,a["id"]))
        c.execute("INSERT INTO shots(id,pid,ord,scene,plot,dialogue,emotion,prompt,keyframe,characters,environments,confidence,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",(uid(),pid,int(m["order"]),m["scene"],m["plot"],m["dialogue"],m["emotion"],m["prompt"],m["keyframe"],json.dumps(m["characters"]),json.dumps(m["environments"]),m["confidence"],"review"))
-     j["success"]+=1
+     if m.get("errors"):j["errors"].append({"id":a["id"],"label":a["label"],"error":"；".join(m["errors"])[:500]})
+     else:j["success"]+=1
     except Exception as e:
+     with db() as c:
+      c.execute("UPDATE shots SET scene=?,plot=?,dialogue=?,emotion=?,confidence=0,status=? WHERE pid=? AND keyframe=? AND status!=?",("分析失败","","","","pending",pid,a["id"],"approved"))
      logging.exception("Frame analysis failed")
      j["errors"].append({"id":a["id"],"label":a["label"],"error":str(e)[:500]})
     finally:j["done"]+=1

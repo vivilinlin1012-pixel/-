@@ -20,9 +20,10 @@ def unpack(content):
         except ValueError:continue
     raise ValueError("模型未返回完整JSON对象")
 
-async def call(url,key,model,messages,required=()):
+async def call(url,key,model,messages,required=(),schema=None):
     local=url.startswith(("http://127.0.0.1:","http://localhost:"))
     payload={"model":model,"temperature":0.1,"messages":messages,"response_format":{"type":"json_object"},"max_tokens":2048}
+    if schema:payload["response_format"]={"type":"json_schema","json_schema":{"name":"storyboard_links","strict":True,"schema":schema}}
     async with httpx.AsyncClient(timeout=httpx.Timeout(600,connect=15),trust_env=not local) as client:
         for attempt in range(2):
             resp=await client.post(url,headers={"Authorization":"Bearer "+key},json=payload)
@@ -30,7 +31,7 @@ async def call(url,key,model,messages,required=()):
             choice=resp.json()["choices"][0]
             try:
                 obj=unpack(choice["message"].get("content"))
-                if not obj or any(not obj.get(k) for k in required):raise ValueError("缺少有效字段")
+                if not obj or any(k not in obj for k in required):raise ValueError("缺少有效字段")
                 return obj
             except ValueError:
                 if attempt:raise ValueError("模型连续两次未返回完整JSON；结束原因："+str(choice.get("finish_reason")))
@@ -125,7 +126,9 @@ async def match_keyframes(pid,store,script,assets,base,key,model,target=None,pro
         task={"keyframe":visual,"script":[{"n":i+1,"text":lines[i]} for i in chosen]}
         for kind,pool in pools.items():
             task[kind]=[{"n":i+1,"name":x["name"],"visual":x["visual"]} for i,x in enumerate(pool)]
-        m=await call(endpoint,key,model,[{"role":"user","content":"你只负责匹配三个独立素材池。根据关键图选择真实对应的剧情原文编号、对白编号、人物定妆照编号、环境编号。各池编号独立，不确定返回空数组。不要生成视频指令。返回JSON：{\"scene\":\"场次\",\"plot\":[1],\"dialogue\":[],\"character\":[1],\"environment\":[1],\"emotion\":\"可见人物情绪\"}。"+json.dumps(task,ensure_ascii=False)}])
+        fields=("plot","dialogue","character","environment")
+        schema={"type":"object","properties":{**{k:{"type":"array","items":{"type":"integer"}} for k in fields},"scene":{"type":"string"},"emotion":{"type":"string"}},"required":[*fields,"scene","emotion"],"additionalProperties":False}
+        m=await call(endpoint,key,model,[{"role":"system","content":"你是素材关联器。只输出匹配结果对象，不复述输入素材。各池编号独立。无匹配返回空数组。"},{"role":"user","content":json.dumps(task,ensure_ascii=False)+"\n选择对应剧情、原文对白、人物和环境的编号。输出字段 plot, dialogue, character, environment, scene, emotion。"}],required=fields,schema=schema)
         diagnostic=Path(store)/pid/"match-diagnostics"
         diagnostic.mkdir(exist_ok=True)
         (diagnostic/(a["id"]+".json")).write_text(json.dumps({"keyframe":a["label"],"input":task,"model_response":m},ensure_ascii=False,indent=2))

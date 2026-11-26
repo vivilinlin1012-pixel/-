@@ -1,6 +1,6 @@
 import io,os,re,json,uuid,sqlite3,zipfile
-import httpx
-from vision import match_keyframes
+import httpx,asyncio,logging
+from vision import match_keyframes,call
 from pathlib import Path
 from contextlib import contextmanager
 from fastapi import FastAPI,File,Form,UploadFile,HTTPException
@@ -44,7 +44,7 @@ class Shot(BaseModel):
 @app.get("/")
 def index():return FileResponse(ROOT/"web/index.html")
 @app.get("/api/health")
-def health():return {"ok":True,"ai_configured":bool(os.getenv("CINEFLOW_AI_BASE_URL") and os.getenv("CINEFLOW_AI_API_KEY") and os.getenv("CINEFLOW_AI_MODEL"))}
+def health():return {"ok":True,"ai_configured":True}
 @app.get("/api/projects")
 def projects():
  with db() as c:return [dict(x) for x in c.execute("SELECT id,title FROM projects")]
@@ -115,21 +115,50 @@ def parse(pid:str):
    if not c.execute("SELECT id FROM shots WHERE pid=? AND keyframe=?",(pid,a["id"])).fetchone():
     c.execute("INSERT INTO shots(id,pid,ord,scene,plot,dialogue,keyframe) VALUES (?,?,?,?,?,?,?)",(uid(),pid,i,"待分析","","",a["id"]))
  return {"shots_created":len(keys)}
+jobs={}
+tasks=set()
+def settings():
+ return (os.getenv("CINEFLOW_AI_BASE_URL","http://127.0.0.1:11434/v1"),os.getenv("CINEFLOW_AI_API_KEY","local"),os.getenv("CINEFLOW_AI_MODEL","qwen2.5vl:7b"))
+@app.post("/api/ai-test")
+async def ai_test():
+ base,key,model=settings()
+ try:
+  await call(base.rstrip("/")+"/chat/completions",key,model,[{"role":"user","content":"返回JSON对象：{\"ok\":true}"}],required=("ok",))
+ except Exception as e:raise HTTPException(502,"模型测试失败："+str(e)) from e
+ return {"ok":True}
+@app.get("/api/projects/{pid}/job")
+def job_status(pid:str):
+ need(pid)
+ return jobs.get(pid,{"state":"idle"})
 @app.post("/api/projects/{pid}/match")
-async def match(pid:str):
+async def match(pid:str,target:str="",retry:bool=False):
  d=data(pid)
+ if any(j["state"]=="running" for j in jobs.values()):raise HTTPException(409,"已有分析任务运行中")
  if not d["project"]["script"].strip():raise HTTPException(400,"请先导入剧本")
- if not any(a["kind"]=="keyframe" for a in d["assets"]):raise HTTPException(400,"请先导入关键图")
- base=os.getenv("CINEFLOW_AI_BASE_URL","");token=os.getenv("CINEFLOW_AI_API_KEY","");model=os.getenv("CINEFLOW_AI_MODEL","")
- if not all((base,token,model)):raise HTTPException(400,"请先配置视觉AI模型；不会用上传顺序冒充智能匹配")
- try:results=await match_keyframes(pid,STORE,d["project"]["script"],d["assets"],base,token,model)
- except Exception as exc:raise HTTPException(502,"AI分析失败，原有结果未修改："+type(exc).__name__) from exc
- with db() as c:
-  c.execute("DELETE FROM shots WHERE pid=? AND status!='approved'",(pid,))
-  for i,m in enumerate(results):
-   if c.execute("SELECT id FROM shots WHERE pid=? AND keyframe=? AND status='approved'",(pid,m["keyframe"])).fetchone():continue
-   c.execute("INSERT INTO shots(id,pid,ord,scene,plot,dialogue,emotion,prompt,keyframe,characters,environments,confidence,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",(uid(),pid,i,m["scene"],m["plot"],m["dialogue"],m["emotion"],m["prompt"],m["keyframe"],json.dumps(m["characters"]),json.dumps(m["environments"]),m["confidence"],"review"))
- return {"matched":len(results),"mode":"ai","message":"关键图智能分析完成，请检查结果"}
+ existing={s["keyframe"]:s for s in d["shots"]}
+ keys=[a for a in d["assets"] if a["kind"]=="keyframe" and (not target or a["id"]==target) and existing.get(a["id"],{}).get("status")!="approved"]
+ if retry:keys=[a for a in keys if not existing.get(a["id"],{}).get("plot") or not existing.get(a["id"],{}).get("emotion")]
+ if not keys:raise HTTPException(400,"没有需要分析的关键图")
+ base,token,model=settings()
+ j=jobs[pid]={"state":"running","total":len(keys),"done":0,"success":0,"errors":[],"message":"准备分析"}
+ async def worker():
+  try:
+   for a in keys:
+    try:
+     results=await match_keyframes(pid,STORE,d["project"]["script"],d["assets"],base,token,model,target=a["id"],progress=lambda msg:j.update(message=msg))
+     m=results[0]
+     with db() as c:
+      if not c.execute("SELECT id FROM shots WHERE pid=? AND keyframe=? AND status='approved'",(pid,a["id"])).fetchone():
+       c.execute("DELETE FROM shots WHERE pid=? AND keyframe=? AND status!='approved'",(pid,a["id"]))
+       c.execute("INSERT INTO shots(id,pid,ord,scene,plot,dialogue,emotion,prompt,keyframe,characters,environments,confidence,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",(uid(),pid,int(m["order"]),m["scene"],m["plot"],m["dialogue"],m["emotion"],m["prompt"],m["keyframe"],json.dumps(m["characters"]),json.dumps(m["environments"]),m["confidence"],"review"))
+     j["success"]+=1
+    except Exception as e:
+     logging.exception("Frame analysis failed")
+     j["errors"].append({"id":a["id"],"label":a["label"],"error":str(e)[:500]})
+    finally:j["done"]+=1
+  finally:j.update(state="finished",message=f'完成：成功 {j["success"]}，失败 {len(j["errors"])}')
+ t=asyncio.create_task(worker());tasks.add(t);t.add_done_callback(tasks.discard)
+ return j
 @app.patch("/api/projects/{pid}/shots/{sid}")
 def edit(pid:str,sid:str,body:Shot):
  d=data(pid);fields=body.model_dump(exclude_unset=True)

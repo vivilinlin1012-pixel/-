@@ -85,7 +85,7 @@ async def match_keyframes(pid,store,script,assets,base,key,model,target=None,pro
         path=Path(store)/pid/"assets"/a["path"]
         cache=Path(store)/pid/"vision-cache"
         cache.mkdir(exist_ok=True)
-        name=hashlib.sha256((base+model+a["id"]+"v3").encode()).hexdigest()
+        name=hashlib.sha256((base+model+a["id"]+"v5").encode()).hexdigest()
         p=cache/(name+".json")
         if p.exists():return json.loads(p.read_text())
         progress("识别素材："+a["label"])
@@ -101,18 +101,30 @@ async def match_keyframes(pid,store,script,assets,base,key,model,target=None,pro
         visual=await cached(a)
         progress("匹配剧本原文："+a["label"])
         task={"script_lines":[{"n":i+1,"text":line} for i,line in enumerate(lines)],"keyframe":visual}
-        m=await call(endpoint,key,model,[{"role":"user","content":'根据画面匹配剧本。只返回JSON：{"scene":"场次","plot_lines":[1],"dialogue_lines":[],"emotion":"人物情绪","confidence":0.8}。剧情行号必须来自输入，不选标题或元数据。无对白返回空数组。'+json.dumps(task,ensure_ascii=False)}],required=("scene","plot_lines","emotion"))
+        m=await call(endpoint,key,model,[{"role":"user","content":'根据画面匹配剧本。先排除与可见环境、人物服装、动作、昼夜明显冲突的场次。只选当前镜头直接对应的连续剧情和对白，不得把后续场次台词混入。只返回JSON：{"scene":"场次","plot_lines":[1],"dialogue_lines":[],"emotion":"人物情绪","confidence":0.8}。剧情行号必须来自输入，不选标题或元数据。无对白返回空数组。'+json.dumps(task,ensure_ascii=False)}],required=("scene","plot_lines","emotion"))
         def source(k):
             values=m.get(k,[])
             return "\n".join(lines[n-1] for n in values if type(n)==int and 1<=n<=len(lines)) if isinstance(values,list) else ""
         plot=source("plot_lines");dialogue=source("dialogue_lines")
         if not plot or not isinstance(m["emotion"],str):raise ValueError("未找到有效剧情")
         progress("匹配人物与环境："+a["label"])
-        candidates=[{"n":i+1,"kind":x["kind"],"label":x["label"]} for i,x in enumerate(refs)]
-        matchrefs=await call(endpoint,key,model,[{"role":"user","content":'根据画面描述、原文剧情及素材名称选出对应角色造型和环境。仅返回JSON：{"characters":[1],"environments":[2]}。编号必须来自候选列表且类别一致；不确定返回空数组。'+json.dumps({"visual":visual,"plot":plot,"scene":m["scene"],"refs":candidates},ensure_ascii=False)}]) if refs else {}
+        candidates=[]
+        for i,x in enumerate(refs):
+            try:
+                description=await cached(x)
+            except (ValueError,httpx.HTTPError,OSError) as exc:
+                description={"analysis_error":str(exc)}
+            candidates.append({"n":i+1,"kind":x["kind"],"label":x["label"],"visual":description})
+        matchrefs=await call(endpoint,key,model,[{"role":"user","content":'优先比较关键图与参考素材的视觉描述：人物年龄、发型、服装、建筑、陈设、光线。素材名称仅辅助判断，剧情冲突时以可见画面为准。仅返回JSON：{"characters":[1],"environments":[2]}。编号必须来自候选列表且类别一致；不确定返回空数组。'+json.dumps({"visual":visual,"plot":plot,"scene":m["scene"],"refs":candidates},ensure_ascii=False)}]) if refs else {}
         def pick(k,kind):
             v=matchrefs.get(k,[])
-            return [refs[n-1]["id"] for n in v if type(n)==int and 1<=n<=len(refs) and refs[n-1]["kind"]==kind] if isinstance(v,list) else []
+            if not isinstance(v,list):return []
+            selected=[]
+            for n in v:
+                if isinstance(n,str) and n.strip().isdigit():n=int(n.strip())
+                if type(n)==int and 1<=n<=len(refs) and refs[n-1]["kind"]==kind:
+                    selected.append(refs[n-1]["id"])
+            return list(dict.fromkeys(selected))
         try:score=max(0,min(1,float(m.get("confidence",0))))
         except (ValueError,TypeError):score=0
         out.append(dict(keyframe=a["id"],scene=str(m["scene"]),plot=plot,dialogue=dialogue,emotion=m["emotion"],prompt="",characters=pick("characters","character"),environments=pick("environments","environment"),confidence=score,order=assets.index(a)))
